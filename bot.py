@@ -2,7 +2,8 @@ import asyncio
 import os
 import random
 
-import aiosqlite
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
@@ -19,7 +20,13 @@ from aiogram.types import (
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-DB = "queue.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN не найден")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не найден")
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -37,60 +44,94 @@ class Registration(StatesGroup):
 # DATABASE
 # =========================
 
-async def init_db():
-    async with aiosqlite.connect(DB) as db:
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER UNIQUE
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                chat_id INTEGER PRIMARY KEY,
-                message_id INTEGER,
-                mode TEXT
-            )
-        """)
-
-        await db.commit()
+def get_db():
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require"
+    )
 
 
-async def get_user(user_id):
-    async with aiosqlite.connect(DB) as db:
-        cursor = await db.execute(
-            "SELECT name FROM users WHERE user_id = ?",
-            (user_id,)
+def init_db():
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            name TEXT NOT NULL
         )
-        return await cursor.fetchone()
+    """)
 
-
-async def get_users():
-    async with aiosqlite.connect(DB) as db:
-        cursor = await db.execute(
-            "SELECT user_id, name FROM users ORDER BY name"
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS queue (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT UNIQUE NOT NULL
         )
-        return await cursor.fetchall()
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            chat_id BIGINT PRIMARY KEY,
+            message_id BIGINT,
+            mode TEXT DEFAULT 'free'
+        )
+    """)
+
+    db.commit()
+    cursor.close()
+    db.close()
 
 
-async def get_queue():
-    async with aiosqlite.connect(DB) as db:
-        cursor = await db.execute("""
-            SELECT q.user_id, u.name
-            FROM queue q
-            JOIN users u ON q.user_id = u.user_id
-            ORDER BY q.id
-        """)
-        return await cursor.fetchall()
+def get_user(user_id):
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute(
+        "SELECT name FROM users WHERE user_id = %s",
+        (user_id,)
+    )
+
+    result = cursor.fetchone()
+
+    cursor.close()
+    db.close()
+
+    return result
+
+
+def get_users():
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute(
+        "SELECT user_id, name FROM users ORDER BY name"
+    )
+
+    result = cursor.fetchall()
+
+    cursor.close()
+    db.close()
+
+    return result
+
+
+def get_queue():
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        SELECT q.user_id, u.name
+        FROM queue q
+        JOIN users u ON q.user_id = u.user_id
+        ORDER BY q.id
+    """)
+
+    result = cursor.fetchall()
+
+    cursor.close()
+    db.close()
+
+    return result
 
 
 # =========================
@@ -164,21 +205,70 @@ def admin_keyboard():
 async def is_admin(chat_id, user_id):
 
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(
+            chat_id,
+            user_id
+        )
 
-        return member.status in ("administrator", "creator")
+        return member.status in (
+            "administrator",
+            "creator"
+        )
 
     except Exception:
         return False
 
 
 # =========================
-# QUEUE TEXT
+# MODE
 # =========================
 
-async def queue_text(mode="free"):
+def get_mode(chat_id):
 
-    queue = await get_queue()
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute(
+        "SELECT mode FROM settings WHERE chat_id = %s",
+        (chat_id,)
+    )
+
+    result = cursor.fetchone()
+
+    cursor.close()
+    db.close()
+
+    if result:
+        return result[0]
+
+    return "free"
+
+
+def set_mode(chat_id, mode):
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        INSERT INTO settings (chat_id, mode)
+        VALUES (%s, %s)
+        ON CONFLICT (chat_id)
+        DO UPDATE SET mode = EXCLUDED.mode
+    """, (chat_id, mode))
+
+    db.commit()
+
+    cursor.close()
+    db.close()
+
+
+# =========================
+# QUEUE MESSAGE
+# =========================
+
+def queue_text(mode):
+
+    queue = get_queue()
 
     if mode == "random":
         title = "🎲 <b>СЛУЧАЙНАЯ ОЧЕРЕДЬ</b>"
@@ -188,8 +278,12 @@ async def queue_text(mode="free"):
     text = f"🎓 {title}\n\n"
 
     if not queue:
+
         text += "📭 <b>Очередь пока пустая.</b>\n\n"
-        text += "Нажмите кнопку ниже, чтобы встать в очередь."
+
+        if mode == "free":
+            text += "Нажмите кнопку ниже, чтобы встать в очередь."
+
         return text
 
     text += "━━━━━━━━━━━━━━━━━━\n"
@@ -198,105 +292,112 @@ async def queue_text(mode="free"):
 
         if number == 1:
             text += f"🟢 <b>1. {name}</b> ← сейчас\n"
+
         elif number == 2:
             text += f"🥈 <b>2. {name}</b>\n"
+
         elif number == 3:
             text += f"🥉 <b>3. {name}</b>\n"
+
         else:
             text += f"{number}. {name}\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
-    text += f"👥 Всего в очереди: <b>{len(queue)}</b>"
+    text += f"👥 Всего: <b>{len(queue)}</b>"
 
     return text
 
 
 # =========================
-# UPDATE MESSAGE
+# SAVE MAIN MESSAGE
 # =========================
 
-async def save_message(chat_id, message_id, mode):
+def save_message(chat_id, message_id, mode):
 
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        await db.execute("""
-            INSERT INTO settings (chat_id, message_id, mode)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chat_id)
-            DO UPDATE SET
-                message_id = excluded.message_id,
-                mode = excluded.mode
-        """, (chat_id, message_id, mode))
+    cursor.execute("""
+        INSERT INTO settings (chat_id, message_id, mode)
+        VALUES (%s, %s, %s)
 
-        await db.commit()
+        ON CONFLICT (chat_id)
+        DO UPDATE SET
+            message_id = EXCLUDED.message_id,
+            mode = EXCLUDED.mode
+    """, (chat_id, message_id, mode))
+
+    db.commit()
+
+    cursor.close()
+    db.close()
 
 
-async def get_mode(chat_id):
+def get_message_id(chat_id):
 
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        cursor = await db.execute(
-            "SELECT mode FROM settings WHERE chat_id = ?",
-            (chat_id,)
-        )
+    cursor.execute(
+        "SELECT message_id FROM settings WHERE chat_id = %s",
+        (chat_id,)
+    )
 
-        result = await cursor.fetchone()
+    result = cursor.fetchone()
 
-        return result[0] if result else "free"
+    cursor.close()
+    db.close()
+
+    return result[0] if result else None
 
 
 async def update_queue_message(chat_id):
 
-    async with aiosqlite.connect(DB) as db:
+    message_id = get_message_id(chat_id)
 
-        cursor = await db.execute(
-            "SELECT message_id, mode FROM settings WHERE chat_id = ?",
-            (chat_id,)
-        )
-
-        result = await cursor.fetchone()
-
-    if not result:
+    if not message_id:
         return
 
-    message_id, mode = result
+    mode = get_mode(chat_id)
 
     try:
 
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text=await queue_text(mode),
+            text=queue_text(mode),
             parse_mode="HTML",
             reply_markup=main_keyboard()
         )
 
-    except Exception:
-        pass
+    except Exception as e:
+
+        if "message is not modified" not in str(e):
+            print("Ошибка обновления сообщения:", e)
 
 
 # =========================
-# START / REGISTRATION
+# START
 # =========================
 
 @dp.message(Command("start"))
 async def start(message: Message, state: FSMContext):
 
-    # Регистрация только в личке
     if message.chat.type != "private":
+
         await message.answer(
-            "👋 Чтобы зарегистрироваться, напиши мне /start в личных сообщениях."
+            "👋 Для регистрации открой личку со мной и напиши /start"
         )
+
         return
 
-    user = await get_user(message.from_user.id)
+    user = get_user(message.from_user.id)
 
     if user:
 
         await message.answer(
             f"👋 Привет, <b>{user[0]}</b>!\n\n"
-            "✅ Ты уже зарегистрирован.\n"
-            "Теперь можешь участвовать в очереди.",
+            "✅ Ты уже зарегистрирован.",
             parse_mode="HTML"
         )
 
@@ -304,14 +405,20 @@ async def start(message: Message, state: FSMContext):
 
     await message.answer(
         "🎓 <b>Добро пожаловать!</b>\n\n"
-        "Для начала введи своё имя и фамилию.\n\n"
+        "Введи своё имя и фамилию.\n\n"
         "Например:\n"
         "<i>Карим Байнашов</i>",
         parse_mode="HTML"
     )
 
-    await state.set_state(Registration.waiting_name)
+    await state.set_state(
+        Registration.waiting_name
+    )
 
+
+# =========================
+# SAVE NAME
+# =========================
 
 @dp.message(Registration.waiting_name)
 async def save_name(message: Message, state: FSMContext):
@@ -319,25 +426,37 @@ async def save_name(message: Message, state: FSMContext):
     name = message.text.strip()
 
     if len(name) < 2:
-        await message.answer("❌ Напиши нормальное имя и фамилию.")
-        return
 
-    async with aiosqlite.connect(DB) as db:
-
-        await db.execute(
-            "INSERT INTO users (user_id, name) VALUES (?, ?)",
-            (message.from_user.id, name)
+        await message.answer(
+            "❌ Введи имя и фамилию."
         )
 
-        await db.commit()
+        return
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        INSERT INTO users (user_id, name)
+        VALUES (%s, %s)
+        ON CONFLICT (user_id)
+        DO UPDATE SET name = EXCLUDED.name
+    """, (
+        message.from_user.id,
+        name
+    ))
+
+    db.commit()
+
+    cursor.close()
+    db.close()
 
     await state.clear()
 
     await message.answer(
-        f"✅ <b>Готово!</b>\n\n"
-        f"Тебя зарегистрировали как:\n"
-        f"👤 <b>{name}</b>\n\n"
-        "Теперь ты можешь участвовать в очереди группы.",
+        f"✅ <b>Регистрация завершена!</b>\n\n"
+        f"👤 {name}\n\n"
+        "Теперь ты можешь участвовать в очереди.",
         parse_mode="HTML"
     )
 
@@ -353,7 +472,11 @@ async def admin_panel(message: Message):
         message.chat.id,
         message.from_user.id
     ):
-        await message.answer("❌ Только для администраторов.")
+
+        await message.answer(
+            "❌ Только для администраторов группы."
+        )
+
         return
 
     await message.answer(
@@ -365,7 +488,7 @@ async def admin_panel(message: Message):
 
 
 # =========================
-# CREATE QUEUE MESSAGE
+# CREATE QUEUE
 # =========================
 
 @dp.message(Command("queue"))
@@ -375,92 +498,120 @@ async def create_queue(message: Message):
         message.chat.id,
         message.from_user.id
     ):
+
         await message.answer(
-            "❌ Только учитель/администратор может создать очередь."
+            "❌ Только учитель может создать очередь."
         )
+
         return
 
+    mode = "free"
+
+    set_mode(
+        message.chat.id,
+        mode
+    )
+
     msg = await message.answer(
-        await queue_text("free"),
+        queue_text(mode),
         parse_mode="HTML",
         reply_markup=main_keyboard()
     )
 
-    await save_message(
+    save_message(
         message.chat.id,
         msg.message_id,
-        "free"
+        mode
     )
 
 
 # =========================
-# JOIN QUEUE
+# JOIN
 # =========================
 
 @dp.callback_query(F.data == "join")
 async def join_queue(callback: CallbackQuery):
 
-    user = await get_user(callback.from_user.id)
+    chat_id = callback.message.chat.id
+
+    mode = get_mode(chat_id)
+
+    if mode == "random":
+
+        await callback.answer(
+            "🎲 Сейчас действует случайная очередь.",
+            show_alert=True
+        )
+
+        return
+
+    user = get_user(
+        callback.from_user.id
+    )
 
     if not user:
 
         await callback.answer(
-            "❌ Сначала зарегистрируйся через /start в личке с ботом.",
+            "❌ Сначала зарегистрируйся через /start в личке.",
             show_alert=True
         )
+
         return
 
-    queue = await get_queue()
+    queue = get_queue()
 
-    # Уже в очереди?
     for user_id, _ in queue:
 
         if user_id == callback.from_user.id:
 
             position = next(
-                i for i, x in enumerate(queue, 1)
-                if x[0] == callback.from_user.id
+                i for i, item in enumerate(queue, 1)
+                if item[0] == callback.from_user.id
             )
 
             await callback.answer(
-                f"⚠️ Ты уже в очереди! Позиция: №{position}",
+                f"⚠️ Ты уже в очереди! №{position}",
                 show_alert=True
             )
 
             return
 
-    # Добавляем
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        await db.execute(
-            "INSERT INTO queue (user_id) VALUES (?)",
-            (callback.from_user.id,)
-        )
+    cursor.execute(
+        "INSERT INTO queue (user_id) VALUES (%s)",
+        (callback.from_user.id,)
+    )
 
-        await db.commit()
+    db.commit()
 
-    queue = await get_queue()
+    cursor.close()
+    db.close()
 
-    position = len(queue)
+    position = len(queue) + 1
 
     await callback.answer(
-        f"✅ Ты в очереди! Позиция: №{position}",
+        f"✅ Ты в очереди! Позиция №{position}",
         show_alert=True
     )
 
-    await update_queue_message(callback.message.chat.id)
+    await update_queue_message(chat_id)
 
 
 # =========================
-# MY POSITION
+# POSITION
 # =========================
 
 @dp.callback_query(F.data == "position")
 async def position(callback: CallbackQuery):
 
-    queue = await get_queue()
+    queue = get_queue()
 
-    for number, (user_id, name) in enumerate(queue, 1):
+    for number, (user_id, _) in enumerate(
+        queue,
+        start=1
+    ):
 
         if user_id == callback.from_user.id:
 
@@ -478,44 +629,54 @@ async def position(callback: CallbackQuery):
 
 
 # =========================
-# SHOW QUEUE
+# SHOW
 # =========================
 
 @dp.callback_query(F.data == "show")
 async def show_queue(callback: CallbackQuery):
 
-    mode = await get_mode(callback.message.chat.id)
+    mode = get_mode(
+        callback.message.chat.id
+    )
 
     await callback.answer()
 
     try:
+
         await callback.message.edit_text(
-            await queue_text(mode),
+            queue_text(mode),
             parse_mode="HTML",
             reply_markup=main_keyboard()
         )
-    except Exception:
-        pass
+
+    except Exception as e:
+
+        if "message is not modified" not in str(e):
+            print("Ошибка:", e)
 
 
 # =========================
-# ADMIN: RANDOM
+# RANDOM
 # =========================
 
 @dp.callback_query(F.data == "random")
 async def random_queue(callback: CallbackQuery):
 
+    chat_id = callback.message.chat.id
+
     if not await is_admin(
-        callback.message.chat.id,
+        chat_id,
         callback.from_user.id
     ):
+
         await callback.answer(
-            "❌ Только учитель может рандомизировать.",
+            "❌ Только учитель.",
             show_alert=True
         )
+
         return
 
-    users = await get_users()
+    users = get_users()
 
     if not users:
 
@@ -523,96 +684,113 @@ async def random_queue(callback: CallbackQuery):
             "❌ Пока никто не зарегистрирован.",
             show_alert=True
         )
+
         return
+
+    users = list(users)
 
     random.shuffle(users)
 
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        await db.execute("DELETE FROM queue")
+    cursor.execute(
+        "DELETE FROM queue"
+    )
 
-        for user_id, _ in users:
+    for user_id, _ in users:
 
-            await db.execute(
-                "INSERT INTO queue (user_id) VALUES (?)",
-                (user_id,)
-            )
+        cursor.execute(
+            "INSERT INTO queue (user_id) VALUES (%s)",
+            (user_id,)
+        )
 
-        await db.commit()
+    db.commit()
 
-        await db.execute("""
-            UPDATE settings
-            SET mode = ?
-            WHERE chat_id = ?
-        """, ("random", callback.message.chat.id))
+    cursor.close()
+    db.close()
 
-        await db.commit()
+    set_mode(
+        chat_id,
+        "random"
+    )
 
     await callback.answer(
-        "🎲 Очередь случайно сформирована!",
+        f"🎲 Готово! Перемешано {len(users)} учеников.",
         show_alert=True
     )
 
-    await update_queue_message(callback.message.chat.id)
+    await update_queue_message(chat_id)
 
 
 # =========================
-# ADMIN: FREE QUEUE
+# FREE
 # =========================
 
 @dp.callback_query(F.data == "free")
 async def free_queue(callback: CallbackQuery):
 
+    chat_id = callback.message.chat.id
+
     if not await is_admin(
-        callback.message.chat.id,
+        chat_id,
         callback.from_user.id
     ):
+
         await callback.answer(
-            "❌ Только учитель может менять режим.",
+            "❌ Только учитель.",
             show_alert=True
         )
+
         return
 
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        await db.execute(
-            "DELETE FROM queue"
-        )
+    cursor.execute(
+        "DELETE FROM queue"
+    )
 
-        await db.execute("""
-            UPDATE settings
-            SET mode = ?
-            WHERE chat_id = ?
-        """, ("free", callback.message.chat.id))
+    db.commit()
 
-        await db.commit()
+    cursor.close()
+    db.close()
+
+    set_mode(
+        chat_id,
+        "free"
+    )
 
     await callback.answer(
-        "📝 Включена свободная очередь!",
+        "📝 Свободная очередь включена!",
         show_alert=True
     )
 
-    await update_queue_message(callback.message.chat.id)
+    await update_queue_message(chat_id)
 
 
 # =========================
-# ADMIN: DONE
+# DONE
 # =========================
 
 @dp.callback_query(F.data == "done")
 async def done(callback: CallbackQuery):
 
+    chat_id = callback.message.chat.id
+
     if not await is_admin(
-        callback.message.chat.id,
+        chat_id,
         callback.from_user.id
     ):
+
         await callback.answer(
-            "❌ Только для учителя.",
+            "❌ Только учитель.",
             show_alert=True
         )
+
         return
 
-    queue = await get_queue()
+    queue = get_queue()
 
     if not queue:
 
@@ -620,45 +798,54 @@ async def done(callback: CallbackQuery):
             "📭 Очередь пустая.",
             show_alert=True
         )
+
         return
 
     user_id, name = queue[0]
 
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        await db.execute(
-            "DELETE FROM queue WHERE user_id = ?",
-            (user_id,)
-        )
+    cursor.execute(
+        "DELETE FROM queue WHERE user_id = %s",
+        (user_id,)
+    )
 
-        await db.commit()
+    db.commit()
+
+    cursor.close()
+    db.close()
 
     await callback.answer(
         f"✅ {name} сдал!",
         show_alert=True
     )
 
-    await update_queue_message(callback.message.chat.id)
+    await update_queue_message(chat_id)
 
 
 # =========================
-# ADMIN: SKIP
+# SKIP
 # =========================
 
 @dp.callback_query(F.data == "skip")
 async def skip(callback: CallbackQuery):
 
+    chat_id = callback.message.chat.id
+
     if not await is_admin(
-        callback.message.chat.id,
+        chat_id,
         callback.from_user.id
     ):
+
         await callback.answer(
-            "❌ Только для учителя.",
+            "❌ Только учитель.",
             show_alert=True
         )
+
         return
 
-    queue = await get_queue()
+    queue = get_queue()
 
     if not queue:
 
@@ -666,60 +853,75 @@ async def skip(callback: CallbackQuery):
             "📭 Очередь пустая.",
             show_alert=True
         )
+
         return
 
     user_id, name = queue[0]
 
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        await db.execute(
-            "DELETE FROM queue WHERE user_id = ?",
-            (user_id,)
-        )
+    cursor.execute(
+        "DELETE FROM queue WHERE user_id = %s",
+        (user_id,)
+    )
 
-        await db.commit()
+    db.commit()
+
+    cursor.close()
+    db.close()
 
     await callback.answer(
         f"⏭ {name} пропущен.",
         show_alert=True
     )
 
-    await update_queue_message(callback.message.chat.id)
+    await update_queue_message(chat_id)
 
 
 # =========================
-# ADMIN: RESET
+# RESET
 # =========================
 
 @dp.callback_query(F.data == "reset")
 async def reset(callback: CallbackQuery):
 
+    chat_id = callback.message.chat.id
+
     if not await is_admin(
-        callback.message.chat.id,
+        chat_id,
         callback.from_user.id
     ):
+
         await callback.answer(
-            "❌ Только для учителя.",
+            "❌ Только учитель.",
             show_alert=True
         )
+
         return
 
-    async with aiosqlite.connect(DB) as db:
+    db = get_db()
+    cursor = db.cursor()
 
-        await db.execute("DELETE FROM queue")
+    cursor.execute(
+        "DELETE FROM queue"
+    )
 
-        await db.commit()
+    db.commit()
+
+    cursor.close()
+    db.close()
 
     await callback.answer(
         "🔄 Очередь очищена!",
         show_alert=True
     )
 
-    await update_queue_message(callback.message.chat.id)
+    await update_queue_message(chat_id)
 
 
 # =========================
-# ADMIN: STUDENTS
+# STUDENTS
 # =========================
 
 @dp.callback_query(F.data == "students")
@@ -729,25 +931,31 @@ async def students(callback: CallbackQuery):
         callback.message.chat.id,
         callback.from_user.id
     ):
+
         await callback.answer(
-            "❌ Только для учителя.",
+            "❌ Только учитель.",
             show_alert=True
         )
+
         return
 
-    users = await get_users()
+    users = get_users()
 
     if not users:
 
         await callback.answer(
-            "📭 Никто ещё не зарегистрирован.",
+            "📭 Никто не зарегистрирован.",
             show_alert=True
         )
+
         return
 
-    text = "👥 <b>ЗАРЕГИСТРИРОВАННЫЕ УЧЕНИКИ</b>\n\n"
+    text = "👥 <b>УЧЕНИКИ</b>\n\n"
 
-    for number, (_, name) in enumerate(users, 1):
+    for number, (_, name) in enumerate(
+        users,
+        start=1
+    ):
 
         text += f"{number}. {name}\n"
 
@@ -760,14 +968,15 @@ async def students(callback: CallbackQuery):
 
 
 # =========================
-# MAIN
+# START BOT
 # =========================
 
 async def main():
 
-    await init_db()
+    init_db()
 
     print("🤖 Бот запущен!")
+    print("🗄 PostgreSQL подключена!")
 
     await dp.start_polling(bot)
 
